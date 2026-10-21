@@ -115,13 +115,15 @@ def ffprobe(path) -> dict:
     r = _run([fp, "-v", "error", "-show_entries", "format=duration,format_name:stream=codec_type,codec_name,width,height",
               "-of", "json", str(path)])
     j = json.loads(r.stdout or "{}")
+    if not j:
+        print("ffprobe failed:", path, r.returncode, r.stderr[-800:], flush=True)
     st = j.get("streams", [])
     return {"duration": float(j.get("format", {}).get("duration", 0) or 0), "format": j.get("format", {}).get("format_name"),
             "video": [s for s in st if s.get("codec_type") == "video"], "audio": [s for s in st if s.get("codec_type") == "audio"]}
 
 
 def run(out: Path) -> int:
-    out = Path(out)
+    out = Path(out).resolve()
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True)
     os.environ.setdefault("VDL_DATA_DIR", str(out / "appdata"))

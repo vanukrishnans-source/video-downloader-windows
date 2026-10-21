@@ -406,7 +406,7 @@ def download(it: Item, folder: str, *, quality: str | None = None, cookies=None,
     cancel = cancel or threading.Event()
     quality = quality or it.quality
     log = log or _Log()
-    folder = str(Path(folder))
+    folder = str(Path(folder).resolve())
     Path(folder).mkdir(parents=True, exist_ok=True)
     tmp = Path(folder) / f".vdl-part-{uuid.uuid4().hex[:8]}"
     result = {"path": None}
