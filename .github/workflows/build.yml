@@ -106,7 +106,7 @@ jobs:
             Get-Content "$out\gui_report.json" -Raw | Out-Host
             $rep = Get-Content "$out\gui_report.json" -Raw | ConvertFrom-Json
             if ($p.ExitCode -ne 0) { throw "GUI run failed" }
-            if (@($rep.items).Count -lt 4) { throw "expected >= 4 queue items" }
+            if (@($rep.items).Count -ne 3) { throw "expected 3 queue items (clip, hls, second; page clip is a duplicate)" }
             if (@($rep.errors).Count -ne 1) { throw "expected exactly one friendly error (nothing.html)" }
             foreach ($it in $rep.items) {
               if ($it.status -ne "done") { throw "item not done: $($it.url) $($it.message)" }
