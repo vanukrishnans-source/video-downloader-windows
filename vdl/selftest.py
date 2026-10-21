@@ -34,15 +34,17 @@ def make_fixtures(root: Path):
     enc = (["-c:v", "libx264", "-preset", "veryfast"] if h264 else ["-c:v", "mpeg4", "-q:v", "4"]) + \
         ["-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p"]
     # MPEG-TS segments for H.264 (the common case); fMP4 segments when the bundled LGPL ffmpeg has no H.264 encoder
-    seg = ["-hls_segment_type", "mpegts"] if h264 else ["-hls_segment_type", "fmp4"]
+    # MPEG-TS segments like real sites; the LGPL ffmpeg has no H.264 encoder, so its fixture uses MPEG-2 video in TS
+    seg = ["-hls_segment_type", "mpegts"]
+    hls_enc = enc if h264 else ["-c:v", "mpeg2video", "-q:v", "4", "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p"]
     if not (root / "clip.mp4").exists():
         r = _run([ff, "-y", "-hide_banner", "-loglevel", "error", *src, "-t", "5", *enc, "-movflags", "+faststart", str(root / "clip.mp4")])
         if r.returncode:
             raise RuntimeError(r.stderr)
     (root / "hls").mkdir(exist_ok=True)
     if not (root / "hls" / "index.m3u8").exists():
-        r = _run([ff, "-y", "-hide_banner", "-loglevel", "error", *src, "-t", "6", *enc, "-f", "hls", "-hls_time", "2",
-                  "-hls_playlist_type", "vod", *seg, "-hls_segment_filename", str(root / "hls" / ("seg%03d.ts" if h264 else "seg%03d.m4s")), str(root / "hls" / "index.m3u8")])
+        r = _run([ff, "-y", "-hide_banner", "-loglevel", "error", *src, "-t", "6", *hls_enc, "-f", "hls", "-hls_time", "2",
+                  "-hls_playlist_type", "vod", *seg, "-hls_segment_filename", str(root / "hls" / "seg%03d.ts"), str(root / "hls" / "index.m3u8")])
         if r.returncode:
             raise RuntimeError(r.stderr)
     if not (root / "second.webm").exists():  # VP8 + Vorbis, built into every ffmpeg
