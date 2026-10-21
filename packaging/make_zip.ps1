@@ -1,0 +1,18 @@
+# Assemble the portable zip from the PyInstaller onedir output.
+$ErrorActionPreference = "Stop"
+$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$dist = Join-Path $root "dist\VideoDownloader"
+$stage = Join-Path $root "dist\pkg\VideoDownloader"
+if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+New-Item -ItemType Directory -Force -Path $stage | Out-Null
+Copy-Item -Recurse "$dist\*" $stage
+Copy-Item (Join-Path $root "README.md") $stage -Force
+Copy-Item (Join-Path $root "THIRD_PARTY.md") $stage -Force
+Copy-Item (Join-Path $root "LICENSE") $stage -Force
+$ver = (Get-Content (Join-Path $root "vdl\__init__.py") | Select-String '__version__\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+$zip = Join-Path $root "dist\VideoDownloader-$ver-win64.zip"
+if (Test-Path $zip) { Remove-Item $zip }
+Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+$sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+"$sha  VideoDownloader-$ver-win64.zip" | Out-File -Encoding ascii (Join-Path $root "dist\SHA256SUMS")
+Write-Host "ZIP $zip ($((Get-Item $zip).Length) bytes) SHA256 $sha"

@@ -1,0 +1,203 @@
+# Build Video Downloader (Windows x64 portable zip), test the PACKAGED exe end-to-end on windows-latest, publish a Release.
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create / update the GitHub Release with the zip"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.13"
+  PYTHONUTF8: "1"
+  FFMPEG_ASSET: "ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip"
+  QJS_TAG: "v0.17.0"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-win.txt
+
+      - name: Install Python deps
+        shell: pwsh
+        run: |
+          python -m pip install -U pip wheel
+          pip install -r requirements-win.txt
+          python -c "import PySide6, yt_dlp.version, yt_dlp_ejs; print(PySide6.__version__, yt_dlp.version.__version__)"
+
+      - name: Fetch bundled tools (FFmpeg LGPL shared, QuickJS)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path tools, _dl | Out-Null
+          gh release download latest -R BtbN/FFmpeg-Builds -p $env:FFMPEG_ASSET -D _dl
+          Expand-Archive "_dl\$env:FFMPEG_ASSET" -DestinationPath _dl\ff
+          $bin = Get-ChildItem _dl\ff -Recurse -Directory -Filter bin | Select-Object -First 1
+          Copy-Item "$($bin.FullName)\ffmpeg.exe", "$($bin.FullName)\ffprobe.exe" tools\
+          Copy-Item "$($bin.FullName)\*.dll" tools\
+          $lic = Get-ChildItem _dl\ff -Recurse -Filter LICENSE.txt | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName tools\FFMPEG-LICENSE.txt }
+          gh release download $env:QJS_TAG -R quickjs-ng/quickjs -p "qjs-windows-x86_64.exe" -D _dl
+          Copy-Item _dl\qjs-windows-x86_64.exe tools\qjs.exe
+          & tools\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          & tools\qjs.exe -e "console.log('qjs ok', 6*7)"
+          "{0:N1} MB tools" -f ((Get-ChildItem tools -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Source selftest (python, bundled tools)
+        shell: pwsh
+        run: |
+          $env:VDL_TOOLS = "$PWD\tools"
+          python -m vdl --selftest --selftest-out selftest-out\src
+          if ($LASTEXITCODE -ne 0) { Get-Content selftest-out\src\selftest_report.json; throw "source selftest failed" }
+
+      - name: PyInstaller (onedir, GUI exe + console exe)
+        shell: pwsh
+        run: |
+          pyinstaller VideoDownloader.spec --noconfirm
+          if (-not (Test-Path dist\VideoDownloader\_internal\tools\ffmpeg.exe)) { throw "ffmpeg not bundled" }
+          if (-not (Test-Path dist\VideoDownloader\_internal\engine\yt_dlp\__init__.py)) { throw "engine not bundled" }
+          "{0:N1} MB" -f ((Get-ChildItem dist/VideoDownloader -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: "Selftest - packaged VideoDownloader_cli.exe (fixture MP4, HLS, page scan, queue, cancel, errors, engine update)"
+        shell: pwsh
+        run: |
+          $out = "$PWD\selftest-out\cli"
+          & dist\VideoDownloader\VideoDownloader_cli.exe --version
+          & dist\VideoDownloader\VideoDownloader_cli.exe --selftest --selftest-out $out
+          $code = $LASTEXITCODE
+          Get-Content "$out\selftest_report.json" | Select-String '"name"|"ok"'
+          if ($code -ne 0) { Get-Content "$out\selftest_report.json"; throw "selftest failed: $code" }
+
+      - name: "GUI - packaged windowed exe, real window (fetch 4 links, queue, download, error row, cancel)"
+        shell: pwsh
+        run: |
+          $srv = Start-Process -FilePath dist\VideoDownloader\VideoDownloader_cli.exe -ArgumentList @("--serve-fixture","--fixture-port","8765") -PassThru -WindowStyle Hidden
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 120; $i++) {
+              try { $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/page.html -TimeoutSec 3; if ($r.StatusCode -eq 200) { $ok = $true; break } } catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $ok) { throw "fixture server did not start" }
+            $b = "http://127.0.0.1:8765"
+            $out = "$PWD\screens-ci"
+            $save = "$PWD\selftest-out\gui-saved"
+            New-Item -ItemType Directory -Force -Path $out, $save | Out-Null
+            $p = Start-Process -FilePath dist\VideoDownloader\VideoDownloader.exe -PassThru -Wait -ArgumentList @(
+              "--urls","`"$b/clip.mp4|$b/hls/index.m3u8|$b/page.html|$b/nothing.html`"","--playlist","--quality","720p","--download",
+              "--folder","`"$save`"","--shots-dir","`"$out`"","--report","`"$out\gui_report.json`"","--size","1280x720","--timeout","300")
+            Write-Host "GUI exit code $($p.ExitCode)"
+            Get-Content "$out\gui_report.json" -Raw | Out-Host
+            $rep = Get-Content "$out\gui_report.json" -Raw | ConvertFrom-Json
+            if ($p.ExitCode -ne 0) { throw "GUI run failed" }
+            if (@($rep.items).Count -lt 4) { throw "expected >= 4 queue items" }
+            if (@($rep.errors).Count -ne 1) { throw "expected exactly one friendly error (nothing.html)" }
+            foreach ($it in $rep.items) {
+              if ($it.status -ne "done") { throw "item not done: $($it.url) $($it.message)" }
+              $pr = & dist\VideoDownloader\_internal\tools\ffprobe.exe -v error -show_entries stream=codec_type -of csv=p=0 "$($it.path)"
+              if (-not ($pr -match "video")) { throw "no video stream in $($it.path)" }
+            }
+            # cancel through the real window
+            $save2 = "$PWD\selftest-out\gui-cancel"
+            New-Item -ItemType Directory -Force -Path $save2 | Out-Null
+            $p2 = Start-Process -FilePath dist\VideoDownloader\VideoDownloader.exe -PassThru -Wait -ArgumentList @(
+              "--urls","`"$b/slow/clip.mp4`"","--download","--cancel-after","2","--folder","`"$save2`"",
+              "--shots-dir","`"$out`"","--shot-prefix","cancel_","--report","`"$out\gui_cancel.json`"","--size","1280x720","--timeout","120")
+            $rep2 = Get-Content "$out\gui_cancel.json" -Raw | ConvertFrom-Json
+            if ($rep2.items[0].status -ne "cancelled") { throw "cancel failed: $($rep2.items[0].status)" }
+            $left = @(Get-ChildItem $save2 -Force)
+            if ($left.Count -ne 0) { throw "partial files left after cancel: $($left.Name)" }
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Make portable zip
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File packaging/make_zip.ps1
+          Get-ChildItem dist\*.zip | Format-Table Name, Length
+          Get-Content dist\SHA256SUMS
+
+      - name: Anonymous zip verify (extract + run --version + selftest)
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist\VideoDownloader-*-win64.zip | Select-Object -First 1
+          $tmp = Join-Path $env:TEMP "vdl-anon-verify"
+          if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+          Expand-Archive $zip.FullName -DestinationPath $tmp
+          $exe = Get-ChildItem $tmp -Recurse -Filter VideoDownloader_cli.exe | Select-Object -First 1
+          & $exe.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "extracted exe failed" }
+          $env:VDL_SELFTEST_ONLINE = "0"
+          & $exe.FullName --selftest --selftest-out "$tmp\st"
+          if ($LASTEXITCODE -ne 0) { throw "extracted selftest failed" }
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoDownloader-win64-tests
+          path: |
+            selftest-out/**/*.json
+            screens-ci/**
+            dist/SHA256SUMS
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoDownloader-win64-zip
+          path: dist/VideoDownloader-*-win64.zip
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = Get-ChildItem dist\VideoDownloader-*-win64.zip | Select-Object -First 1
+          $ver = $zip.Name -replace '^VideoDownloader-(.+)-win64\.zip$', '$1'
+          $tag = if ("${{ github.ref }}".StartsWith("refs/tags/")) { "${{ github.ref_name }}" } else { "v$ver" }
+          $sha = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          $r = Get-Content selftest-out\cli\selftest_report.json -Raw | ConvertFrom-Json
+          $lines = @(
+            "Video Downloader **$ver** - portable Windows 10/11 x64. Paste a link, see thumbnail / title / length, pick Best / 1080p / 720p / 480p / MP3 / M4A, Browse for a folder, Download.",
+            "",
+            "| Asset | Size | SHA-256 |",
+            "|---|---|---|",
+            "| $($zip.Name) | $($zip.Length) bytes | ``$sha`` |",
+            "",
+            "### Run",
+            "1. Unzip, open the **VideoDownloader** folder, run **VideoDownloader.exe**.",
+            "2. SmartScreen (unsigned build): **More info** -> **Run anyway**.",
+            "",
+            "### CI (windows-latest, packaged exe)",
+            "- Selftest: $($r.passed) / $($r.total) checks passed (direct MP4, HLS 720p, MP3 + M4A, page scan, multi-video page, queue with a broken link, cancel + cleanup, friendly errors, engine update + fallback). All outputs checked with ffprobe.",
+            "- Real windowed exe: fetch 4 links -> queue -> download -> files verified; cancel mid-download leaves no partial files.",
+            "",
+            "Does not bypass DRM or region locks. Details: https://github.com/${{ github.repository }}#readme"
+          )
+          $lines -join "`n" | Out-File -Encoding utf8 notes.md
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag $zip.FullName dist\SHA256SUMS --title "Video Downloader $tag" --notes-file notes.md
+          } else {
+            gh release upload $tag $zip.FullName dist\SHA256SUMS --clobber
+            gh release edit $tag --notes-file notes.md
+          }

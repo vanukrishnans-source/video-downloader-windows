@@ -1,0 +1,5 @@
+# Windows x64 build (Python 3.13)
+PySide6-Essentials==6.12.0
+yt-dlp[default]==2026.8.19
+pyinstaller==6.22.3
+requests
